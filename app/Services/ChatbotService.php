@@ -15,30 +15,29 @@ class ChatbotService
 
     public function handle(string $message, string $convId, string $ip): array
     {
-        // 1) Proteksi tambahan: block IP sementara kalau terdeteksi abusive
-        if ($this->isTemporarilyBlocked($ip)) {
-            return [
-                'reply' => "Akses dari IP ini sementara dibatasi karena terlalu banyak permintaan. Coba lagi beberapa menit lagi.",
-                'meta' => ['blocked' => true],
-            ];
-        }
-
-        // 2) Buat plan query dari pertanyaan
         $plan = $this->planner->plan($message);
-
-        // 3) Jalankan query aman (hanya tabel ikm_koperindag)
         $data = $this->dataService->runPlan($plan);
 
-        // 4) Siapkan ringkasan (batasi ukuran)
-        $payload = $this->buildCompactPayload($plan, $data);
+        // facts deterministik (agar jawaban konsisten)
+        $factsText = $this->formatFacts($data, $plan);
 
-        // 5) Panggil OpenAI (dengan caching agar hemat & tahan spam)
+        $payload = [
+            'plan' => $plan,
+            'facts' => $factsText,   // <--- kunci utama
+            'data' => $this->compactData($data),
+        ];
+
+        // cache jawaban singkat (boleh, tapi jangan terlalu lama)
         $cacheKey = 'chat_answer:' . sha1(json_encode($payload));
-        $reply = Cache::remember($cacheKey, now()->addMinutes(2), function () use ($message, $payload) {
+        $reply = Cache::remember($cacheKey, now()->addSeconds(30), function () use ($message, $payload) {
             return $this->askOpenAI($message, $payload);
         });
 
-        // 6) Logging audit ringan
+        // jika OpenAI error / jawaban kosong, fallback ke facts
+        if (!$reply || mb_strlen(trim($reply)) < 3) {
+            $reply = $factsText ?: 'Maaf, sistem belum bisa memproses pertanyaan tersebut.';
+        }
+
         Log::info('chat_request', [
             'conv_id' => $convId,
             'ip' => $ip,
@@ -61,19 +60,18 @@ class ChatbotService
         $apiKey = env('OPENAI_API_KEY');
         $model  = env('OPENAI_MODEL', 'gpt-4o-mini');
 
-        if (!$apiKey) {
-            return 'OPENAI_API_KEY belum diisi di .env';
-        }
+        if (!$apiKey) return 'OPENAI_API_KEY belum diisi di .env';
 
-        $system = "Kamu adalah analis data untuk Bupati Pringsewu. "
-            . "Jawab dalam Bahasa Indonesia yang jelas, ringkas, berbasis data. "
-            . "Kamu HANYA boleh menggunakan data yang diberikan dalam JSON payload (hasil query dari tabel ikm_koperindag). "
-            . "Jika data tidak cukup, katakan apa yang kurang dan sarankan pertanyaan lanjutan. "
-            . "Jangan membuat angka atau fakta baru.";
+        $system = "Kamu adalah analis data untuk Bupati Pringsewu.\n"
+            . "ATURAN WAJIB:\n"
+            . "1) Jawaban harus berdasarkan FACTS yang diberikan.\n"
+            . "2) Jangan bilang 'data kosong' jika facts berisi angka/daftar.\n"
+            . "3) Jika pertanyaan minta TOP/terbanyak, sebutkan peringkat 1 dan ringkasan top 5.\n"
+            . "4) Jika pertanyaan tidak cocok dengan data tabel ikm_koperindag, jelaskan keterbatasannya.";
 
         $messages = [
             ['role' => 'system', 'content' => $system],
-            ['role' => 'user', 'content' => "Pertanyaan:\n{$userMessage}\n\nData (JSON):\n" . json_encode($payload, JSON_UNESCAPED_UNICODE)],
+            ['role' => 'user', 'content' => "Pertanyaan:\n{$userMessage}\n\nFACTS:\n{$payload['facts']}\n\nData (JSON ringkas):\n" . json_encode($payload['data'], JSON_UNESCAPED_UNICODE)],
         ];
 
         $res = Http::timeout(25)
@@ -85,57 +83,88 @@ class ChatbotService
             ]);
 
         if (!$res->ok()) {
-            // kalau sering error, block sementara ip di layer lain
-            return "Gagal memproses AI (HTTP {$res->status()}). Coba lagi.";
+            return $payload['facts'] ?: "Gagal memproses AI (HTTP {$res->status()}).";
         }
 
         $json = $res->json();
-        $text = $json['choices'][0]['message']['content'] ?? null;
-
-        return $text ?: 'AI tidak mengembalikan jawaban.';
+        return $json['choices'][0]['message']['content'] ?? ($payload['facts'] ?: 'AI tidak mengembalikan jawaban.');
     }
 
-    private function buildCompactPayload(array $plan, array $data): array
+    private function compactData(array $data): array
     {
-        // Pastikan ukuran tidak kebesaran (untuk token & keamanan)
-        $out = [
-            'plan' => $plan,
-            'data' => [],
-        ];
-
         if (($data['kind'] ?? '') === 'aggregate') {
-            $out['data'] = [
+            return [
                 'kind' => 'aggregate',
                 'group_by' => $data['group_by'] ?? null,
                 'metric' => $data['metric'] ?? null,
-                'rows' => collect($data['rows'] ?? [])->take(50)->values(),
+                'rows' => collect($data['rows'] ?? [])->take(15)->values(),
             ];
-        } elseif (($data['kind'] ?? '') === 'compare') {
-            $out['data'] = [
+        }
+
+        if (($data['kind'] ?? '') === 'compare') {
+            return [
                 'kind' => 'compare',
                 'compare_col' => $data['compare_col'] ?? null,
                 'metric' => $data['metric'] ?? null,
                 'result' => $data['result'] ?? [],
             ];
-        } else {
-            $out['data'] = [
-                'kind' => 'list',
-                'rows' => collect($data['rows'] ?? [])->take(20)->values(),
-            ];
         }
 
-        return $out;
+        return [
+            'kind' => 'list',
+            'rows' => collect($data['rows'] ?? [])->take(15)->values(),
+        ];
     }
 
-    private function isTemporarilyBlocked(string $ip): bool
+    private function formatFacts(array $data, array $plan): string
     {
-        // jika IP sudah diblokir, tolak
-        if (Cache::get("block_ip:{$ip}") === true) {
-            return true;
+        $kind = $data['kind'] ?? '';
+        $metric = $data['metric'] ?? ($plan['metric'] ?? 'count');
+
+        if ($kind === 'compare') {
+            $res = $data['result'] ?? [];
+            if (!$res || count($res) === 0) {
+                return "Tidak ada pasangan kecamatan yang berhasil dibandingkan (compare_values kosong atau tidak terbaca).";
+            }
+            $lines = [];
+            foreach ($res as $k => $v) {
+                $lines[] = "- {$k}: {$v}";
+            }
+            return "Hasil perbandingan (" . ($metric === 'sum_tenaga_kerja' ? 'Total Tenaga Kerja' : 'Jumlah IKM') . "):\n" . implode("\n", $lines);
         }
 
-        // hit request error/abuse count (contoh sederhana)
-        // (kamu bisa tambah logic: jika kena rate-limit berkali-kali -> block)
-        return false;
+        if ($kind === 'aggregate') {
+            $rows = $data['rows'] ?? [];
+            if (!$rows || count($rows) === 0) {
+                return "Query agregat tidak menghasilkan baris (kemungkinan kolom banyak kosong, atau data belum ada).";
+            }
+
+            $label = ($metric === 'sum_tenaga_kerja') ? 'Total Tenaga Kerja' : 'Jumlah IKM';
+            $groupBy = $data['group_by'] ?? ($plan['group_by'] ?? 'kecamatan');
+
+            $lines = [];
+            $i = 1;
+            foreach ($rows as $r) {
+                $k = $r->{$groupBy} ?? '(kosong)';
+                $v = $r->value ?? 0;
+                $lines[] = "{$i}. {$k}: {$v}";
+                $i++;
+                if ($i > 10) break;
+            }
+
+            return "Agregat {$label} per {$groupBy} (Top " . min(10, count($rows)) . "):\n" . implode("\n", $lines);
+        }
+
+        if ($kind === 'list') {
+            $rows = $data['rows'] ?? [];
+            if (!$rows || count($rows) === 0) return "Tidak ada data yang dapat ditampilkan untuk permintaan list.";
+            $lines = [];
+            foreach ($rows as $r) {
+                $lines[] = "- {$r->nama_perusahaan} | {$r->kecamatan} | {$r->jenis_produk} | tenaga_kerja: {$r->jumlah_tenaga_kerja}";
+            }
+            return "Daftar data (sample):\n" . implode("\n", array_slice($lines, 0, 10));
+        }
+
+        return "";
     }
 }

@@ -6,7 +6,6 @@ use Illuminate\Support\Facades\DB;
 
 class IKMDataService
 {
-    // whitelist kolom untuk mencegah query aneh
     private array $allowedColumns = [
         'id',
         'nama_perusahaan',
@@ -25,37 +24,22 @@ class IKMDataService
 
     public function runPlan(array $plan): array
     {
-        // plan minimal:
-        // [
-        //   "type" => "aggregate"|"list"|"compare",
-        //   "group_by" => "kecamatan"|...,
-        //   "metric" => "count"|"sum_tenaga_kerja",
-        //   "filters" => [ ["col"=>"kecamatan","op"=>"=","val"=>"..."], ... ],
-        //   "limit" => 10
-        // ]
-
         $type = $plan['type'] ?? 'aggregate';
         $filters = $plan['filters'] ?? [];
-        $limit = (int) ($plan['limit'] ?? 10);
-        $limit = max(1, min(50, $limit));
+        $limit = max(1, min(50, (int)($plan['limit'] ?? 10)));
 
         $q = DB::table('ikm_koperindag');
 
-        // apply filters aman
+        // filters aman
         foreach ($filters as $f) {
             $col = $f['col'] ?? '';
             $op  = $f['op'] ?? '=';
             $val = $f['val'] ?? null;
 
-            if (!in_array($col, $this->allowedColumns, true)) {
-                continue;
-            }
+            if (!in_array($col, $this->allowedColumns, true)) continue;
 
-            // operator aman
             $allowedOps = ['=', '!=', 'like'];
-            if (!in_array($op, $allowedOps, true)) {
-                $op = '=';
-            }
+            if (!in_array($op, $allowedOps, true)) $op = '=';
 
             if ($op === 'like' && is_string($val)) {
                 $q->where($col, 'like', '%' . $val . '%');
@@ -65,7 +49,6 @@ class IKMDataService
         }
 
         if ($type === 'list') {
-            // listing data ringkas
             $rows = $q->select([
                     'nama_perusahaan',
                     'kecamatan',
@@ -76,29 +59,36 @@ class IKMDataService
                 ->limit($limit)
                 ->get();
 
-            return [
-                'kind' => 'list',
-                'rows' => $rows,
-            ];
+            return ['kind' => 'list', 'rows' => $rows];
         }
 
         if ($type === 'compare') {
-            // compare biasanya 2 filter value (misal kecamatan A vs B)
-            // kita jalankan dua agregat berdasarkan compare_values
             $compareCol = $plan['compare_col'] ?? 'kecamatan';
             $vals = $plan['compare_values'] ?? [];
             $metric = $plan['metric'] ?? 'count';
 
-            if (!in_array($compareCol, $this->allowedColumns, true)) {
-                $compareCol = 'kecamatan';
-            }
+            if (!in_array($compareCol, $this->allowedColumns, true)) $compareCol = 'kecamatan';
+
+            $vals = array_values(array_filter(array_map(fn($v) => trim((string)$v), $vals), fn($x) => mb_strlen($x) >= 2));
 
             $out = [];
             foreach (array_slice($vals, 0, 5) as $v) {
                 $qq = clone $q;
-                $qq->where($compareCol, '=', $v);
+                $needle = mb_strtolower(trim($v));
 
-                $out[$v] = $this->computeMetric($qq, $metric);
+                // 1) exact match: TRIM+LOWER
+                $qqExact = clone $qq;
+                $qqExact->whereRaw("LOWER(TRIM($compareCol)) = ?", [$needle]);
+                $valueExact = $this->computeMetric($qqExact, $metric);
+
+                // 2) fallback LIKE jika exact 0
+                if ($valueExact === 0) {
+                    $qqLike = clone $qq;
+                    $qqLike->whereRaw("LOWER(TRIM($compareCol)) LIKE ?", ['%' . $needle . '%']);
+                    $out[$v] = $this->computeMetric($qqLike, $metric);
+                } else {
+                    $out[$v] = $valueExact;
+                }
             }
 
             return [
@@ -109,22 +99,29 @@ class IKMDataService
             ];
         }
 
-        // default aggregate
+        // aggregate
         $groupBy = $plan['group_by'] ?? 'kecamatan';
-        if (!in_array($groupBy, $this->allowedColumns, true)) {
-            $groupBy = 'kecamatan';
-        }
+        if (!in_array($groupBy, $this->allowedColumns, true)) $groupBy = 'kecamatan';
 
         $metric = $plan['metric'] ?? 'count';
 
+        // penting: abaikan nilai null/kosong agar "Top 10 jenis produk" tidak jadi aneh
+        $qAgg = clone $q;
+        $qAgg->whereNotNull($groupBy)->whereRaw("TRIM($groupBy) <> ''");
+
         $select = [$groupBy];
+
+        // SUM tenaga kerja lebih robust:
+        // - buang spasi
+        // - CAST UNSIGNED
+        // catatan: ini aman untuk MySQL umum
         if ($metric === 'sum_tenaga_kerja') {
-            $select[] = DB::raw('COALESCE(SUM(jumlah_tenaga_kerja),0) as value');
+            $select[] = DB::raw("COALESCE(SUM(CAST(TRIM(jumlah_tenaga_kerja) AS UNSIGNED)),0) as value");
         } else {
-            $select[] = DB::raw('COUNT(*) as value');
+            $select[] = DB::raw("COUNT(*) as value");
         }
 
-        $rows = $q->select($select)
+        $rows = $qAgg->select($select)
             ->groupBy($groupBy)
             ->orderByDesc('value')
             ->limit($limit)
@@ -141,8 +138,9 @@ class IKMDataService
     private function computeMetric($query, string $metric): int
     {
         if ($metric === 'sum_tenaga_kerja') {
-            return (int) $query->sum('jumlah_tenaga_kerja');
+            $row = $query->select(DB::raw("COALESCE(SUM(CAST(TRIM(jumlah_tenaga_kerja) AS UNSIGNED)),0) as s"))->first();
+            return (int)($row->s ?? 0);
         }
-        return (int) $query->count();
+        return (int)$query->count();
     }
 }
