@@ -9,72 +9,117 @@ use Illuminate\Support\Facades\Cache;
 class ChatbotService
 {
     public function __construct(
-        private IKMQueryPlanner $planner,
-        private IKMDataService $dataService
+        protected IKMQueryPlanner $planner,
+        protected IKMDataService $dataService
     ) {}
 
-    public function handle(string $message, string $convId, string $ip): array
+    /**
+     * ENTRY POINT (HARUS SAMA DENGAN CONTROLLER)
+     */
+    public function handle(array $payload): array
     {
-        $plan = $this->planner->plan($message);
-        $data = $this->dataService->runPlan($plan);
+        try {
+            $question = $payload['question'] ?? '';
+            $convId   = $payload['conversation_id'] ?? null;
+            $ip       = $payload['ip'] ?? null;
 
-        // facts deterministik (agar jawaban konsisten)
-        $factsText = $this->formatFacts($data, $plan);
+            if (!$question) {
+                return [
+                    'reply' => 'Pertanyaan tidak boleh kosong.',
+                    'meta' => [],
+                ];
+            }
 
-        $payload = [
-            'plan' => $plan,
-            'facts' => $factsText,   // <--- kunci utama
-            'data' => $this->compactData($data),
-        ];
+            /* ===============================
+             * PLAN QUERY
+             * =============================== */
+            $plan = $this->planner->plan($question);
 
-        // cache jawaban singkat (boleh, tapi jangan terlalu lama)
-        $cacheKey = 'chat_answer:' . sha1(json_encode($payload));
-        $reply = Cache::remember($cacheKey, now()->addSeconds(30), function () use ($message, $payload) {
-            return $this->askOpenAI($message, $payload);
-        });
+            /* ===============================
+             * AMBIL DATA DB
+             * =============================== */
+            $data = $this->dataService->runPlan($plan);
 
-        // jika OpenAI error / jawaban kosong, fallback ke facts
-        if (!$reply || mb_strlen(trim($reply)) < 3) {
-            $reply = $factsText ?: 'Maaf, sistem belum bisa memproses pertanyaan tersebut.';
-        }
+            /* ===============================
+             * FACTS (ANTI HALUSINASI)
+             * =============================== */
+            $factsText = $this->formatFacts($data, $plan);
 
-        Log::info('chat_request', [
-            'conv_id' => $convId,
-            'ip' => $ip,
-            'message' => mb_substr($message, 0, 300),
-            'plan' => $plan,
-            'data_kind' => $data['kind'] ?? null,
-        ]);
+            $compact = $this->compactData($data);
 
-        return [
-            'reply' => $reply,
-            'meta' => [
+            $cacheKey = 'chat_answer:' . sha1(json_encode([
+                'q' => $question,
+                'facts' => $factsText,
+                'data' => $compact,
+            ]));
+
+            $reply = Cache::remember($cacheKey, now()->addSeconds(30), function () use ($question, $factsText, $compact) {
+                return $this->askOpenAI($question, $factsText, $compact);
+            });
+
+            if (!$reply || mb_strlen(trim($reply)) < 3) {
+                $reply = $factsText ?: 'Maaf, sistem belum dapat menyusun jawaban.';
+            }
+
+            Log::info('chat_request', [
+                'conv_id' => $convId,
+                'ip' => $ip,
+                'question' => mb_substr($question, 0, 200),
                 'plan' => $plan,
                 'data_kind' => $data['kind'] ?? null,
-            ],
-        ];
+            ]);
+
+            return [
+                'reply' => $reply,
+                'meta' => [
+                    'plan' => $plan,
+                    'data_kind' => $data['kind'] ?? null,
+                ],
+            ];
+        } catch (\Throwable $e) {
+            Log::error('ChatbotService error', [
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
+            ]);
+
+            return [
+                'reply' => 'Terjadi kesalahan internal saat memproses data.',
+                'meta' => ['error' => true],
+            ];
+        }
     }
 
-    private function askOpenAI(string $userMessage, array $payload): string
+    /* ===============================
+     * OPENAI CALL
+     * =============================== */
+    private function askOpenAI(string $question, string $facts, array $data): string
     {
         $apiKey = env('OPENAI_API_KEY');
         $model  = env('OPENAI_MODEL', 'gpt-4o-mini');
 
-        if (!$apiKey) return 'OPENAI_API_KEY belum diisi di .env';
+        if (!$apiKey) {
+            return 'OPENAI_API_KEY belum diisi.';
+        }
 
-        $system = "Kamu adalah analis data untuk Bupati Pringsewu.\n"
-            . "ATURAN WAJIB:\n"
-            . "1) Jawaban harus berdasarkan FACTS yang diberikan.\n"
-            . "2) Jangan bilang 'data kosong' jika facts berisi angka/daftar.\n"
-            . "3) Jika pertanyaan minta TOP/terbanyak, sebutkan peringkat 1 dan ringkasan top 5.\n"
-            . "4) Jika pertanyaan tidak cocok dengan data tabel ikm_koperindag, jelaskan keterbatasannya.";
+        $system = <<<SYS
+Kamu adalah analis data resmi untuk Bupati Pringsewu.
+
+ATURAN WAJIB:
+1. Jawaban HARUS berdasarkan FACTS.
+2. Jangan menambah data baru.
+3. Jika diminta "jumlah", sebutkan angka.
+4. Gunakan bahasa ringkas & eksekutif.
+SYS;
 
         $messages = [
             ['role' => 'system', 'content' => $system],
-            ['role' => 'user', 'content' => "Pertanyaan:\n{$userMessage}\n\nFACTS:\n{$payload['facts']}\n\nData (JSON ringkas):\n" . json_encode($payload['data'], JSON_UNESCAPED_UNICODE)],
+            ['role' => 'user', 'content' =>
+                "Pertanyaan:\n{$question}\n\nFACTS:\n{$facts}\n\nDATA (JSON):\n" .
+                json_encode($data, JSON_UNESCAPED_UNICODE)
+            ],
         ];
 
-        $res = Http::timeout(25)
+        $res = Http::timeout(20)
             ->withToken($apiKey)
             ->post('https://api.openai.com/v1/chat/completions', [
                 'model' => $model,
@@ -83,13 +128,15 @@ class ChatbotService
             ]);
 
         if (!$res->ok()) {
-            return $payload['facts'] ?: "Gagal memproses AI (HTTP {$res->status()}).";
+            return $facts ?: 'Gagal menghubungi AI.';
         }
 
-        $json = $res->json();
-        return $json['choices'][0]['message']['content'] ?? ($payload['facts'] ?: 'AI tidak mengembalikan jawaban.');
+        return $res->json('choices.0.message.content', $facts);
     }
 
+    /* ===============================
+     * DATA COMPRESSION
+     * =============================== */
     private function compactData(array $data): array
     {
         if (($data['kind'] ?? '') === 'aggregate') {
@@ -97,74 +144,39 @@ class ChatbotService
                 'kind' => 'aggregate',
                 'group_by' => $data['group_by'] ?? null,
                 'metric' => $data['metric'] ?? null,
-                'rows' => collect($data['rows'] ?? [])->take(15)->values(),
-            ];
-        }
-
-        if (($data['kind'] ?? '') === 'compare') {
-            return [
-                'kind' => 'compare',
-                'compare_col' => $data['compare_col'] ?? null,
-                'metric' => $data['metric'] ?? null,
-                'result' => $data['result'] ?? [],
+                'rows' => collect($data['rows'] ?? [])->take(10)->values(),
             ];
         }
 
         return [
             'kind' => 'list',
-            'rows' => collect($data['rows'] ?? [])->take(15)->values(),
+            'rows' => collect($data['rows'] ?? [])->take(10)->values(),
         ];
     }
 
+    /* ===============================
+     * FACTS FORMATTER
+     * =============================== */
     private function formatFacts(array $data, array $plan): string
     {
-        $kind = $data['kind'] ?? '';
-        $metric = $data['metric'] ?? ($plan['metric'] ?? 'count');
-
-        if ($kind === 'compare') {
-            $res = $data['result'] ?? [];
-            if (!$res || count($res) === 0) {
-                return "Tidak ada pasangan kecamatan yang berhasil dibandingkan (compare_values kosong atau tidak terbaca).";
-            }
-            $lines = [];
-            foreach ($res as $k => $v) {
-                $lines[] = "- {$k}: {$v}";
-            }
-            return "Hasil perbandingan (" . ($metric === 'sum_tenaga_kerja' ? 'Total Tenaga Kerja' : 'Jumlah IKM') . "):\n" . implode("\n", $lines);
+        if (($data['kind'] ?? '') !== 'aggregate') {
+            return 'Data tersedia namun bukan agregat.';
         }
 
-        if ($kind === 'aggregate') {
-            $rows = $data['rows'] ?? [];
-            if (!$rows || count($rows) === 0) {
-                return "Query agregat tidak menghasilkan baris (kemungkinan kolom banyak kosong, atau data belum ada).";
-            }
-
-            $label = ($metric === 'sum_tenaga_kerja') ? 'Total Tenaga Kerja' : 'Jumlah IKM';
-            $groupBy = $data['group_by'] ?? ($plan['group_by'] ?? 'kecamatan');
-
-            $lines = [];
-            $i = 1;
-            foreach ($rows as $r) {
-                $k = $r->{$groupBy} ?? '(kosong)';
-                $v = $r->value ?? 0;
-                $lines[] = "{$i}. {$k}: {$v}";
-                $i++;
-                if ($i > 10) break;
-            }
-
-            return "Agregat {$label} per {$groupBy} (Top " . min(10, count($rows)) . "):\n" . implode("\n", $lines);
+        $rows = $data['rows'] ?? [];
+        if (empty($rows)) {
+            return 'Tidak ada data IKM yang ditemukan.';
         }
 
-        if ($kind === 'list') {
-            $rows = $data['rows'] ?? [];
-            if (!$rows || count($rows) === 0) return "Tidak ada data yang dapat ditampilkan untuk permintaan list.";
-            $lines = [];
-            foreach ($rows as $r) {
-                $lines[] = "- {$r->nama_perusahaan} | {$r->kecamatan} | {$r->jenis_produk} | tenaga_kerja: {$r->jumlah_tenaga_kerja}";
-            }
-            return "Daftar data (sample):\n" . implode("\n", array_slice($lines, 0, 10));
+        $group = $data['group_by'] ?? 'kecamatan';
+        $lines = [];
+
+        foreach ($rows as $r) {
+            $k = $r->{$group} ?? '(kosong)';
+            $v = $r->value ?? 0;
+            $lines[] = "- {$k}: {$v} IKM";
         }
 
-        return "";
+        return "Jumlah IKM per {$group}:\n" . implode("\n", $lines);
     }
 }

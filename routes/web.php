@@ -1,12 +1,18 @@
 <?php
 
-use Illuminate\Support\Facades\Route;
 use App\Http\Controllers\ChatController;
+use Illuminate\Support\Facades\Route;
+/*
+|--------------------------------------------------------------------------
+| CHATBOT AI DASHBOARD PRINGSEWU
+|--------------------------------------------------------------------------
+*/
 
 Route::get('/', [ChatController::class, 'index'])->name('chat.index');
 
+Route::post('/chat', [ChatController::class, 'chat'])->name('chat.send');
+
 Route::post('/conversation/new', [ChatController::class, 'newConversation'])
-    ->middleware(['throttle:chat'])
     ->name('chat.new');
 
 Route::get('/conversation/{id}', [ChatController::class, 'openConversation'])
@@ -14,7 +20,3 @@ Route::get('/conversation/{id}', [ChatController::class, 'openConversation'])
 
 Route::get('/conversation/{id}/download', [ChatController::class, 'downloadConversation'])
     ->name('chat.download');
-
-Route::post('/chat', [ChatController::class, 'chat'])
-    ->middleware(['throttle:chat'])
-    ->name('chat.send');
