@@ -11,7 +11,9 @@ class AppServiceProvider extends ServiceProvider
 {
     public function register(): void
     {
-        //
+        $this->app->singleton(\App\Services\TableSchemaService::class, function () {
+            return new \App\Services\TableSchemaService();
+        });
     }
 
     public function boot(): void
